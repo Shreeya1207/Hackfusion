@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import axios from 'axios';
 
 const API = 'http://localhost:3001/api';
@@ -21,7 +21,131 @@ const Icon = {
   AI: () => <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1v1a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-1H2a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2M7.5 13a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3m9 0a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3" /></svg>,
   UserPlus: () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="8.5" cy="7" r="4" /><line x1="20" y1="8" x2="20" y2="14" /><line x1="23" y1="11" x2="17" y2="11" /></svg>,
   ArrowRight: () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="5" y1="12" x2="19" y2="12" /><polyline points="12 5 19 12 12 19" /></svg>,
+  Upload: () => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="16 16 12 12 8 16" /><line x1="12" y1="12" x2="12" y2="21" /><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3" /></svg>,
 };
+
+// ─── Symptom → Medicine Map ─────────────────────────────────────────────────────
+const SYMPTOM_MAP = {
+  cold: ['Cetirizine 10mg', 'Paracetamol 500mg', 'Amoxicillin 500mg', 'Ibuprofen 200mg'],
+  cough: ['Amoxicillin 250mg', 'Azithromycin 500mg', 'Cetirizine 10mg', 'Paracetamol 500mg'],
+  fever: ['Paracetamol 500mg', 'Ibuprofen 400mg', 'Paracetamol 1000mg', 'Ibuprofen 200mg'],
+  'loose motion': ['Ciprofloxacin 500mg', 'Omeprazole 20mg', 'Paracetamol 500mg', 'Cetirizine 10mg'],
+  headache: ['Ibuprofen 400mg', 'Paracetamol 500mg', 'Ibuprofen 200mg', 'Paracetamol 1000mg'],
+  'body pain': ['Ibuprofen 400mg', 'Paracetamol 500mg', 'Ibuprofen 200mg', 'Paracetamol 1000mg'],
+  vomiting: ['Omeprazole 20mg', 'Ciprofloxacin 500mg', 'Paracetamol 500mg', 'Cetirizine 10mg'],
+  acidity: ['Omeprazole 20mg', 'Paracetamol 500mg', 'Cetirizine 10mg', 'Ibuprofen 200mg'],
+  allergy: ['Cetirizine 10mg', 'Ibuprofen 200mg', 'Paracetamol 500mg', 'Amoxicillin 500mg'],
+  'sore throat': ['Azithromycin 500mg', 'Amoxicillin 500mg', 'Ibuprofen 400mg', 'Paracetamol 500mg'],
+};
+const SYMPTOM_KEYS = Object.keys(SYMPTOM_MAP);
+const detectType = t => SYMPTOM_KEYS.some(k => t.toLowerCase().includes(k)) ? 'symptom' : 'medicine';
+const symptomMeds = (t, all) => { const n = new Set(); SYMPTOM_KEYS.filter(k => t.toLowerCase().includes(k)).forEach(k => SYMPTOM_MAP[k].forEach(x => n.add(x))); return [...n].map(nm => all.find(m => m.name === nm)).filter(Boolean); };
+const medicineMeds = (t, all) => {
+  const seen = new Set(); const res = []; const tl = t.toLowerCase();
+  // Pass 1: scan full text for every medicine/generic base name directly (handles no-comma voice input)
+  all.forEach(x => {
+    const base = x.name.toLowerCase().split(' ')[0];         // e.g. "amoxicillin" from "amoxicillin 250mg"
+    const gen = x.generic_name?.toLowerCase().split(' ')[0]; // e.g. "amoxicillin" from generic name
+    if ((base.length >= 4 && tl.includes(base)) || (gen && gen.length >= 4 && tl.includes(gen))) {
+      if (!seen.has(x.id)) { seen.add(x.id); res.push(x); }
+    }
+  });
+  if (res.length) return res;
+  // Pass 2: fallback — split on comma/newline and match each part
+  t.split(/[,\n]+/).map(p => p.trim()).filter(Boolean).forEach(p => {
+    const l = p.toLowerCase();
+    const m = all.find(x => x.name.toLowerCase().includes(l) || l.includes(x.name.toLowerCase().split(' ')[0]) || (x.generic_name && x.generic_name.toLowerCase().includes(l)));
+    if (m && !seen.has(m.id)) { seen.add(m.id); res.push(m); }
+  });
+  return res;
+};
+
+// ─── Prescription Parser ─────────────────────────────────────────────────────────
+// Parses voice/text like "amoxicillin 200mg twice a day for 3 days Paracetamol 100mg once a day 2 days"
+// Returns [{...medicineFromDB, qty: calculatedTotal, parsedDosageMg, frequency, duration}]
+const parsePrescription = (text, allMeds) => {
+  const tl = text.toLowerCase();
+
+  // Extract frequency (doses per day) from a segment
+  const getFreq = (s) => {
+    if (/thrice|three\s+times/i.test(s) || /\btds\b/i.test(s)) return 3;
+    if (/twice|two\s+times|\b2\s+times|\bbd\b/i.test(s)) return 2;
+    if (/four\s+times|\b4\s+times|\bqid\b/i.test(s)) return 4;
+    const m = s.match(/(\d+)\s*times?\s*(?:a|per)?\s*day/i);
+    return m ? parseInt(m[1]) : 1;
+  };
+
+  // Extract duration in days
+  const getDays = (s) => {
+    const m = s.match(/for\s+(\d+)\s*days?/i) || s.match(/(\d+)\s*days?/i);
+    return m ? parseInt(m[1]) : 1;
+  };
+
+  // Extract dosage in mg as a number
+  const getDosageMg = (s) => {
+    const m = s.match(/(\d+\.?\d*)\s*mg/i);
+    return m ? parseFloat(m[1]) : null;
+  };
+
+  // Find all medicine base names present in the text, with their start index
+  const hits = [];
+  const seenBase = new Set();
+  allMeds.forEach(med => {
+    const base = med.name.toLowerCase().split(' ')[0];
+    const gen = med.generic_name?.toLowerCase().split(' ')[0];
+    ['base', 'gen'].forEach(key => {
+      const term = key === 'base' ? base : gen;
+      if (!term || term.length < 4 || seenBase.has(term)) return;
+      const idx = tl.indexOf(term);
+      if (idx !== -1) { seenBase.add(term); hits.push({ term, idx }); }
+    });
+  });
+
+  hits.sort((a, b) => a.idx - b.idx);
+  if (!hits.length) return [];
+
+  const result = [];
+  hits.forEach(({ term, idx }, i) => {
+    const nextIdx = i < hits.length - 1 ? hits[i + 1].idx : text.length;
+    const segment = text.slice(idx, nextIdx);
+
+    const freq = getFreq(segment);
+    const days = getDays(segment);
+    const parsedDosageMg = getDosageMg(segment);
+
+    // Find all DB medicines matching this base name
+    const candidates = allMeds.filter(m => {
+      const mBase = m.name.toLowerCase().split(' ')[0];
+      const mGen = m.generic_name?.toLowerCase().split(' ')[0];
+      return mBase === term || mGen === term;
+    });
+    if (!candidates.length) return;
+
+    // Pick best dosage match from candidates
+    let best = candidates[0];
+    if (parsedDosageMg && candidates.length > 1) {
+      best = candidates.reduce((b, m) => {
+        const dB = parseFloat(b.dosage?.match(/[\d.]+/)?.[0] ?? 0);
+        const dM = parseFloat(m.dosage?.match(/[\d.]+/)?.[0] ?? 0);
+        return Math.abs(dM - parsedDosageMg) < Math.abs(dB - parsedDosageMg) ? m : b;
+      });
+    }
+
+    const pd = segment.match(/(\d+)\s*(pill|tablet|cap(?:sule)?|drop|ml|teaspoon|sachet)s?/i);
+    const perDose = pd ? parseInt(pd[1]) : 1;
+    const doseUnit = pd ? pd[2].toLowerCase() : 'pill';
+    const totalQtyFinal = Math.max(1, perDose * freq * days);
+    result.push({
+      ...best, qty: totalQtyFinal, perDose, doseUnit,
+      frequency: freq, duration: days, parsedDosageMg,
+      dosageLabel: perDose + ' ' + doseUnit,
+      freqLabel: freq + 'x day',
+      daysLabel: days + 'd',
+    });
+  });
+  return result;
+};
+
 
 // ─── Countdown Bar ──────────────────────────────────────────────────────────────
 function CountdownBar({ seconds, total, label, color = '#2563eb' }) {
@@ -53,7 +177,7 @@ function useVoiceInput(onResult) {
     r.interimResults = true;
     r.lang = 'en-US';
     r.onresult = (e) => {
-      const text = Array.from(e.results).map(x => x[0].transcript).join('');
+      const text = Array.from(e.results).map(x => x[0].transcript.trim()).join(' ').trim();
       onResult(text, fieldHint);
       if (silenceRef.current) clearTimeout(silenceRef.current);
       silenceRef.current = setTimeout(() => stop(), 2000);
@@ -76,273 +200,257 @@ function useVoiceInput(onResult) {
 
 // ─── New Patient Registration Page ─────────────────────────────────────────────
 function NewPatientPage({ detectedName, onPatientCreated, onSkip }) {
-  const [form, setForm] = useState({
-    name: detectedName || '',
-    age: '',
-    gender: '',
-    phone: '',
-    allergies: 'None',
-    email: ''
-  });
+  const [form, setForm] = useState({ name: detectedName || '', age: '', gender: '', phone: '', email: '' });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
-  const [countdown, setCountdown] = useState(null);
+  const [savedPatient, setSavedPatient] = useState(null);
   const [error, setError] = useState('');
-  const [voiceInput, setVoiceInput] = useState('');
   const [recording, setRecording] = useState(false);
-  const [parsing, setParsing] = useState(false);
+  const [voiceText, setVoiceText] = useState('');
+  const [countdown, setCountdown] = useState(null);
+  const [autoSubmitCd, setAutoSubmitCd] = useState(null);
   const timerRef = useRef(null);
+  const autoRef = useRef(null);
+  const cdRef = useRef(null);
   const recognitionRef = useRef(null);
   const silenceRef = useRef(null);
+  const voiceTextRef = useRef('');   // always holds latest transcript for final parse
+  // Use a ref so handleSubmit inside setTimeout sees latest form
+  const formRef = useRef(form);
+  useEffect(() => { formRef.current = form; }, [form]);
+  // parseVoice ref so r.onend closure calls the latest version
+  const parseVoiceRef = useRef(null);
 
-  useEffect(() => {
-    if (saved) setCountdown(5);
-  }, [saved]);
-
+  // Redirect countdown after saved
+  useEffect(() => { if (saved) setCountdown(3); }, [saved]);
   useEffect(() => {
     if (countdown === null) return;
-    if (countdown === 0) { onPatientCreated(); return; }
+    if (countdown === 0) { onPatientCreated(savedPatient); return; }
     timerRef.current = setTimeout(() => setCountdown(c => c - 1), 1000);
     return () => clearTimeout(timerRef.current);
   }, [countdown]);
 
-  // Parse voice transcript and fill form fields automatically
-  const parseAndFill = (text) => {
-    setParsing(true);
+  const allFilled = !!(form.name && form.age && form.gender && form.phone && form.email && form.email.includes('@'));
+
+  // Refs so the timeout callback can check latest saving/saved without being in deps
+  const savingRef = useRef(false);
+  const savedRef = useRef(false);
+  useEffect(() => { savingRef.current = saving; }, [saving]);
+  useEffect(() => { savedRef.current = saved; }, [saved]);
+
+  // Auto-submit countdown when all 4 fields filled
+  // Only depends on allFilled — NOT on saving/saved (to avoid timer cancellation on state change)
+  useEffect(() => {
+    clearTimeout(autoRef.current); clearInterval(cdRef.current); setAutoSubmitCd(null);
+    if (!allFilled) return;
+    stopRecording(); // stop mic once all fields are ready — no need for more voice input
+    setAutoSubmitCd(3);
+    let cd = 3;
+    cdRef.current = setInterval(() => {
+      cd--;
+      setAutoSubmitCd(cd);
+      if (cd <= 0) clearInterval(cdRef.current);
+    }, 1000);
+    autoRef.current = setTimeout(() => {
+      if (!savingRef.current && !savedRef.current) doSubmit(formRef.current);
+    }, 3000);
+    return () => { clearTimeout(autoRef.current); clearInterval(cdRef.current); };
+  }, [allFilled]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const parseVoice = (text) => {
     const t = text.toLowerCase();
-
-    // Extract age
-    const ageMatch = t.match(/age\s+(\d+)|(\d+)\s+years?\s+old/);
-    if (ageMatch) setForm(f => ({ ...f, age: ageMatch[1] || ageMatch[2] }));
-
-    // Extract gender
+    const ageMatch = t.match(/age\s+(\d+)|(\d{1,3})\s+years?/) || t.match(/\b(\d{1,3})\b/);
+    if (ageMatch) {
+      const a = parseInt(ageMatch[1] || ageMatch[2] || ageMatch[3]);
+      if (a && a < 120) setForm(f => ({ ...f, age: String(a) }));
+    }
     if (t.includes('female') || t.includes('woman') || t.includes('girl')) setForm(f => ({ ...f, gender: 'Female' }));
     else if (t.includes('male') || t.includes('man') || t.includes('boy')) setForm(f => ({ ...f, gender: 'Male' }));
-
-    // Extract phone (any sequence of 7-15 digits, possibly with spaces/dashes)
-    const phoneMatch = text.match(/(?:phone|number|contact|mobile)[\s:]+([0-9\s\-\+]{7,15})/i)
-      || text.match(/\b([0-9]{10,15})\b/)
-      || text.match(/\b([0-9]{3}[\s\-][0-9]{3,4}[\s\-][0-9]{4})\b/);
-    if (phoneMatch) setForm(f => ({ ...f, phone: phoneMatch[1].trim() }));
-
-    // Extract email
-    const emailMatch = text.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
-    if (emailMatch) setForm(f => ({ ...f, email: emailMatch[0] }));
-
-    // Extract allergies
-    const allergyMatch = t.match(/allerg(?:y|ies|ic)\s+(?:to\s+)?([^,\.]+)/i)
-      || t.match(/(?:no\s+allergies|none)/i);
-    if (allergyMatch) {
-      const val = allergyMatch[0].toLowerCase().includes('no allerg') || allergyMatch[0].toLowerCase() === 'none'
-        ? 'None' : allergyMatch[1]?.trim() || 'None';
-      setForm(f => ({ ...f, allergies: val }));
+    const ph = text.match(/(?:phone|number|contact|mobile)[\s:]+([0-9\s\-]{7,15})/i) || text.match(/\b([0-9]{10,15})\b/);
+    if (ph) setForm(f => ({ ...f, phone: ph[1].replace(/\s/g, '') }));
+    // Email extraction — anchor to the word "email" in the transcript
+    const emailKeyIdx = t.indexOf('email');
+    if (emailKeyIdx !== -1) {
+      let afterEmail = text.slice(emailKeyIdx + 5).trim();
+      // Skip optional filler words: "email address ..." or "email id ..."
+      afterEmail = afterEmail.replace(/^(?:address|id|:)\s*/i, '');
+      // Try typed format (has @ already): "gaurik@gmail.com"
+      const typedM = afterEmail.match(/([a-zA-Z0-9][a-zA-Z0-9._%+\-]*@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/);
+      if (typedM) {
+        setForm(f => ({ ...f, email: typedM[1] }));
+      } else {
+        // Spoken format — find " at " separator
+        const atIdx = afterEmail.toLowerCase().indexOf(' at ');
+        if (atIdx !== -1) {
+          // Everything before " at " = username  (multi-word → join with dot)
+          const username = afterEmail.slice(0, atIdx).trim().replace(/\s+/g, '.').toLowerCase();
+          // Everything after " at " = domain  (handle "dot" spoken)
+          const domain = afterEmail.slice(atIdx + 4).trim()
+            .replace(/\s+dot\s+/gi, '.').replace(/\s+/g, '').toLowerCase();
+          if (username && domain.includes('.')) {
+            setForm(f => ({ ...f, email: `${username}@${domain}` }));
+          }
+        }
+      }
+    } else {
+      // No "email" keyword — scan whole text for a literal typed email
+      const anyM = text.match(/([a-zA-Z0-9][a-zA-Z0-9._%+\-]*@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/);
+      if (anyM) setForm(f => ({ ...f, email: anyM[1] }));
     }
-
-    setParsing(false);
   };
+  // Keep parseVoiceRef in sync
+  parseVoiceRef.current = parseVoice;
 
   const startRecording = () => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) { alert('Use Chrome or Edge for voice input.'); return; }
-    const r = new SR();
-    r.continuous = true; r.interimResults = true; r.lang = 'en-US';
+    if (!SR) { alert('Use Chrome/Edge for voice input.'); return; }
+    const r = new SR(); r.continuous = true; r.interimResults = true; r.lang = 'en-US';
     r.onresult = (e) => {
-      const text = Array.from(e.results).map(x => x[0].transcript).join('');
-      setVoiceInput(text);
+      const text = Array.from(e.results).map(x => x[0].transcript.trim()).join(' ').trim();
+      voiceTextRef.current = text; // keep ref in sync
+      setVoiceText(text); parseVoice(text);
       if (silenceRef.current) clearTimeout(silenceRef.current);
-      silenceRef.current = setTimeout(() => {
-        stopRecording();
-        parseAndFill(text);
-      }, 2000);
+      silenceRef.current = setTimeout(() => stopRecording(), 4000); // 4s silence = more time for email
     };
     r.onerror = () => stopRecording();
-    r.onend = () => setRecording(false);
-    r.start();
-    recognitionRef.current = r;
-    setRecording(true);
+    r.onend = () => {
+      setRecording(false);
+      // Final parse when recording ends — catches email that arrived in the last segment
+      if (voiceTextRef.current) parseVoiceRef.current?.(voiceTextRef.current);
+    };
+    r.start(); recognitionRef.current = r; setRecording(true);
   };
+  const stopRecording = () => { if (silenceRef.current) clearTimeout(silenceRef.current); recognitionRef.current?.stop(); setRecording(false); };
 
-  const stopRecording = () => {
-    if (silenceRef.current) clearTimeout(silenceRef.current);
-    recognitionRef.current?.stop();
-    setRecording(false);
-  };
-
-  // Auto-start recording when page opens
   useEffect(() => {
-    const timer = setTimeout(() => startRecording(), 800);
-    return () => { clearTimeout(timer); recognitionRef.current?.stop(); };
+    const t = setTimeout(() => startRecording(), 600);
+    return () => { clearTimeout(t); recognitionRef.current?.stop(); };
   }, []);
 
-  const handleSubmit = async () => {
-    if (!form.name.trim()) { setError('Name is required.'); return; }
+  const doSubmit = async (f) => {
+    if (!f.name.trim()) { setError('Name is required.'); return; }
     setSaving(true); setError('');
     try {
-      await axios.post(`${API}/customers`, {
-        name: form.name.trim(),
-        phone: form.phone.trim(),
-        allergies: form.allergies.trim() || 'None',
-        email: form.email.trim(),
-        age: form.age,
-        gender: form.gender,
-        last_visit: new Date().toISOString().split('T')[0]
+      const res = await axios.post(`${API}/customers`, {
+        name: f.name.trim(), phone: f.phone || '', allergies: 'None', email: f.email || '',
+        age: f.age || '', gender: f.gender || '', last_visit: new Date().toISOString().split('T')[0]
       });
-      setSaved(true);
-    } catch (err) {
-      setError(err.response?.data?.error || 'Failed to save patient. Check backend is running.');
-    }
+      const patient = res.data.customer || { id: res.data.customer_id, name: f.name.trim(), ...f };
+      setSavedPatient(patient); setSaved(true);
+    } catch (err) { setError(err.response?.data?.error || 'Failed to save.'); }
     setSaving(false);
   };
+  const handleSubmit = () => doSubmit(formRef.current);
 
-  const inputStyle = { width: '100%', padding: '10px 14px', border: '1px solid #e2e8f0', borderRadius: 8, fontSize: 14, outline: 'none', color: '#0f172a', background: '#fff', boxSizing: 'border-box' };
-  const labelStyle = { fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6, display: 'block' };
+  const inp = { width: '100%', padding: '10px 12px', border: '1px solid #e2e8f0', borderRadius: 8, fontSize: 14, outline: 'none', color: '#0f172a', background: '#fff', boxSizing: 'border-box' };
+  const lbl = { fontSize: 11, fontWeight: 700, color: '#64748b', marginBottom: 5, display: 'block', textTransform: 'uppercase', letterSpacing: 0.5 };
+
+  if (saved) return (
+    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f1f5f9' }}>
+      <div style={{ background: '#fff', borderRadius: 20, padding: 40, textAlign: 'center', maxWidth: 380, boxShadow: '0 8px 32px rgba(0,0,0,0.10)' }}>
+        <div style={{ width: 72, height: 72, borderRadius: '50%', background: '#dcfce7', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 20px', color: '#16a34a', fontSize: 36 }}>✓</div>
+        <h3 style={{ margin: '0 0 8px', fontSize: 22, fontWeight: 800, color: '#16a34a' }}>Registered!</h3>
+        <p style={{ margin: '0 0 4px', color: '#374151', fontSize: 15 }}><strong>{form.name}</strong> added to database.</p>
+        <p style={{ margin: '0 0 20px', color: '#64748b', fontSize: 13 }}>Going to assistant in <strong>{countdown}s</strong>…</p>
+        <div style={{ height: 4, background: '#e2e8f0', borderRadius: 2, marginBottom: 20, overflow: 'hidden' }}>
+          <div style={{ height: '100%', width: `${(countdown / 3) * 100}%`, background: '#16a34a', transition: 'width 1s linear', borderRadius: 2 }} />
+        </div>
+        <button onClick={() => onPatientCreated(savedPatient)} style={{ background: '#2563eb', color: '#fff', border: 'none', borderRadius: 10, padding: '11px 28px', fontWeight: 700, cursor: 'pointer', fontSize: 14 }}>Go Now →</button>
+      </div>
+    </div>
+  );
 
   return (
-    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f1f5f9', padding: 24 }}>
-      <div style={{ background: '#fff', borderRadius: 16, padding: 36, width: '100%', maxWidth: 520, boxShadow: '0 4px 24px rgba(0,0,0,0.08)' }}>
+    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f1f5f9', padding: 20 }}>
+      <div style={{ background: '#fff', borderRadius: 20, padding: 32, width: '100%', maxWidth: 440, boxShadow: '0 8px 32px rgba(0,0,0,0.09)' }}>
 
         {/* Header */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 24 }}>
-          <div style={{ width: 48, height: 48, borderRadius: '50%', background: '#dbeafe', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#2563eb' }}>
-            <Icon.UserPlus />
-          </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
+          <div style={{ width: 46, height: 46, borderRadius: 12, background: '#dbeafe', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#2563eb' }}><Icon.UserPlus /></div>
           <div>
-            <h2 style={{ margin: 0, fontSize: 20, fontWeight: 700 }}>New Patient Registration</h2>
-            <p style={{ margin: 0, fontSize: 13, color: '#64748b' }}>Patient not found · Use voice or type details below</p>
+            <h2 style={{ margin: 0, fontSize: 18, fontWeight: 800 }}>New Patient</h2>
+            <p style={{ margin: 0, fontSize: 12, color: '#64748b' }}>Not found · Register to continue</p>
           </div>
         </div>
 
-        {/* Detected name banner */}
-        {detectedName && !saved && (
-          <div style={{ background: '#fef3c7', border: '1px solid #fde68a', borderRadius: 8, padding: '10px 14px', marginBottom: 16, fontSize: 13, color: '#92400e', display: 'flex', alignItems: 'center', gap: 8 }}>
-            <Icon.Alert /> Detected name: <strong>{detectedName}</strong>
+        {/* Detected name pill */}
+        {detectedName && (
+          <div style={{ background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 8, padding: '7px 12px', marginBottom: 16, fontSize: 13, color: '#1d4ed8', display: 'flex', alignItems: 'center', gap: 6 }}>
+            🔍 Detected: <strong>{detectedName}</strong>
           </div>
         )}
 
-        {!saved ? (
-          <>
-            {/* Single voice input bar */}
-            <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 12, padding: 14, marginBottom: 20 }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: '#64748b', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>
-                🎤 Voice Input — Say everything at once
-              </div>
-              <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 10 }}>
-                Example: <em>"age 28 female phone 9876543210 allergies penicillin"</em>
-              </div>
-
-              {/* Voice transcript display */}
-              <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 8, padding: '8px 12px', minHeight: 36, fontSize: 13, color: voiceInput ? '#0f172a' : '#94a3b8', marginBottom: 10, fontStyle: voiceInput ? 'normal' : 'italic' }}>
-                {voiceInput || (recording ? '🎤 Listening...' : 'Waiting for voice input...')}
-              </div>
-
-              {/* Single mic button */}
-              <div style={{ display: 'flex', gap: 10 }}>
-                <button
-                  onClick={recording ? stopRecording : startRecording}
-                  style={{
-                    flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
-                    background: recording ? '#fee2e2' : '#2563eb',
-                    color: recording ? '#dc2626' : '#fff',
-                    border: recording ? '1px solid #fca5a5' : 'none',
-                    borderRadius: 8, padding: '10px 0', fontWeight: 600, fontSize: 14, cursor: 'pointer'
-                  }}
-                >
-                  {recording ? <><Icon.MicOff /> Stop Recording</> : <><Icon.Mic /> Start Voice Input</>}
-                </button>
-                {voiceInput && (
-                  <button onClick={() => setVoiceInput('')} style={{ background: '#f1f5f9', color: '#64748b', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px', fontSize: 13, cursor: 'pointer' }}>
-                    Clear
-                  </button>
-                )}
-              </div>
-
-              {parsing && (
-                <div style={{ marginTop: 8, fontSize: 12, color: '#2563eb', display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <div style={{ width: 12, height: 12, border: '2px solid #bfdbfe', borderTopColor: '#2563eb', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
-                  Auto-filling fields...
-                </div>
-              )}
-
-              {recording && (
-                <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#dc2626' }}>
-                  <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#dc2626' }} />
-                  Recording... auto-submits after 2s of silence
-                </div>
-              )}
-            </div>
-
-            {/* Form fields (auto-filled by voice, also editable) */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, marginBottom: 16 }}>
-              <div style={{ gridColumn: '1 / -1' }}>
-                <label style={labelStyle}>Full Name *</label>
-                <input style={inputStyle} value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="e.g. Sarah Collins" />
-              </div>
-              <div>
-                <label style={labelStyle}>Age</label>
-                <input style={inputStyle} type="number" value={form.age} onChange={e => setForm(f => ({ ...f, age: e.target.value }))} placeholder="e.g. 32" />
-              </div>
-              <div>
-                <label style={labelStyle}>Gender</label>
-                <select style={inputStyle} value={form.gender} onChange={e => setForm(f => ({ ...f, gender: e.target.value }))}>
-                  <option value="">Select gender</option>
-                  <option value="Female">Female</option>
-                  <option value="Male">Male</option>
-                  <option value="Other">Other</option>
-                </select>
-              </div>
-              <div>
-                <label style={labelStyle}>Phone Number</label>
-                <input style={inputStyle} value={form.phone} onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} placeholder="e.g. 555-0101" />
-              </div>
-              <div>
-                <label style={labelStyle}>Email</label>
-                <input style={inputStyle} value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} placeholder="e.g. sarah@email.com" />
-              </div>
-              <div style={{ gridColumn: '1 / -1' }}>
-                <label style={labelStyle}>Known Allergies</label>
-                <input style={inputStyle} value={form.allergies} onChange={e => setForm(f => ({ ...f, allergies: e.target.value }))} placeholder="e.g. Penicillin (or None)" />
-              </div>
-            </div>
-
-            {error && (
-              <div style={{ background: '#fef2f2', color: '#dc2626', padding: '10px 14px', borderRadius: 8, fontSize: 13, marginBottom: 16, border: '1px solid #fecaca' }}>
-                ❌ {error}
-              </div>
-            )}
-
-            <div style={{ display: 'flex', gap: 12 }}>
-              <button onClick={handleSubmit} disabled={saving} style={{ flex: 1, background: saving ? '#94a3b8' : '#2563eb', color: '#fff', border: 'none', borderRadius: 8, padding: '12px 0', fontWeight: 700, fontSize: 15, cursor: saving ? 'not-allowed' : 'pointer' }}>
-                {saving ? '⏳ Saving...' : '✅ Register Patient'}
-              </button>
-              <button onClick={onSkip} style={{ background: '#f8fafc', color: '#64748b', border: '1px solid #e2e8f0', borderRadius: 8, padding: '12px 20px', fontWeight: 500, fontSize: 14, cursor: 'pointer' }}>
-                Skip
-              </button>
-            </div>
-          </>
-        ) : (
-          <div style={{ textAlign: 'center', padding: '20px 0' }}>
-            <div style={{ width: 64, height: 64, borderRadius: '50%', background: '#dcfce7', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px', color: '#16a34a' }}>
-              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="20 6 9 17 4 12" /></svg>
-            </div>
-            <h3 style={{ margin: '0 0 8px', fontSize: 20, fontWeight: 700, color: '#16a34a' }}>Patient Registered!</h3>
-            <p style={{ color: '#475569', fontSize: 14, margin: '0 0 4px' }}><strong>{form.name}</strong> has been added to the database.</p>
-            <p style={{ color: '#64748b', fontSize: 13, margin: 0 }}>Redirecting to prescription assistant...</p>
-            <CountdownBar seconds={countdown} total={5} label="Redirecting in" color="#16a34a" />
-            <button onClick={onPatientCreated} style={{ marginTop: 20, background: '#2563eb', color: '#fff', border: 'none', borderRadius: 8, padding: '10px 28px', fontWeight: 600, fontSize: 14, cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-              Go Now <Icon.ArrowRight />
+        {/* Voice box */}
+        <div style={{ background: recording ? '#fef2f2' : '#f8fafc', border: `1.5px solid ${recording ? '#fca5a5' : '#e2e8f0'}`, borderRadius: 12, padding: 14, marginBottom: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <button onClick={recording ? stopRecording : startRecording}
+              style={{ width: 42, height: 42, borderRadius: '50%', background: recording ? '#dc2626' : '#2563eb', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', flexShrink: 0 }}>
+              {recording ? <Icon.MicOff /> : <Icon.Mic />}
             </button>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: recording ? '#dc2626' : '#374151' }}>{recording ? '🎤 Listening…' : '🎤 Voice Input'}</div>
+              <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 1 }}>{recording ? 'Say age, gender and phone number' : 'Tap mic · Auto-fills the form below'}</div>
+            </div>
+          </div>
+          {voiceText && <div style={{ marginTop: 10, fontSize: 12, color: '#475569', fontStyle: 'italic', background: '#fff', borderRadius: 6, padding: '6px 10px', border: '1px solid #e2e8f0' }}>"{voiceText}"</div>}
+          {recording && <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: '#dc2626' }}><div style={{ width: 6, height: 6, borderRadius: '50%', background: '#dc2626' }} /> Auto-stops after 2s silence</div>}
+        </div>
+
+        {/* Auto-submit alert */}
+        {allFilled && autoSubmitCd !== null && !saving && (
+          <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: '9px 13px', marginBottom: 14, fontSize: 13, color: '#16a34a', fontWeight: 600 }}>
+            ✅ All 5 fields complete · Auto-registering in {autoSubmitCd}s…
           </div>
         )}
+
+        {/* Form */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 16 }}>
+          <div style={{ gridColumn: '1/-1' }}>
+            <label style={lbl}>Full Name *</label>
+            <input style={inp} value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="e.g. Sarah Collins" />
+          </div>
+          <div>
+            <label style={lbl}>Age</label>
+            <input style={inp} value={form.age} onChange={e => setForm(f => ({ ...f, age: e.target.value }))} placeholder="e.g. 32" />
+          </div>
+          <div>
+            <label style={lbl}>Gender</label>
+            <select style={inp} value={form.gender} onChange={e => setForm(f => ({ ...f, gender: e.target.value }))}>
+              <option value="">Select</option>
+              <option>Female</option><option>Male</option><option>Other</option>
+            </select>
+          </div>
+          <div style={{ gridColumn: '1/-1' }}>
+            <label style={lbl}>Phone Number</label>
+            <input style={inp} value={form.phone} onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} placeholder="e.g. 9876543210" />
+          </div>
+          <div style={{ gridColumn: '1/-1' }}>
+            <label style={lbl}>Email Address *</label>
+            <input style={inp} type="text" value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} placeholder="e.g. patient@gmail.com" />
+          </div>
+        </div>
+
+        {error && <div style={{ background: '#fef2f2', color: '#dc2626', padding: '9px 13px', borderRadius: 8, fontSize: 13, marginBottom: 14, border: '1px solid #fecaca' }}>❌ {error}</div>}
+
+        <div style={{ display: 'flex', gap: 10 }}>
+          <button onClick={handleSubmit} disabled={saving || !form.name.trim()}
+            style={{ flex: 1, background: saving || !form.name.trim() ? '#cbd5e1' : 'linear-gradient(135deg,#2563eb,#1d4ed8)', color: '#fff', border: 'none', borderRadius: 10, padding: '12px 0', fontWeight: 700, fontSize: 14, cursor: saving || !form.name.trim() ? 'not-allowed' : 'pointer' }}>
+            {saving ? '⏳ Saving…' : '✅ Register Patient'}
+          </button>
+          <button onClick={onSkip} style={{ background: '#f8fafc', color: '#64748b', border: '1px solid #e2e8f0', borderRadius: 10, padding: '12px 18px', cursor: 'pointer', fontSize: 13 }}>Skip</button>
+        </div>
       </div>
     </div>
   );
 }
 
+
 // ─── Prescription Card ──────────────────────────────────────────────────────────
-function PrescriptionCard({ data, onCreateOrder, onFindAlternatives, orderCreated }) {
-  const { patient_name, medicines = [], order_date, order_time, grand_total } = data || {};
+function PrescriptionCard({ data, onCreateOrder, orderCreated }) {
+  const { patient_name, medicines = [], order_date, order_time } = data || {};
   if (!data) return null;
   const hasAnyMedicine = medicines.some(m => m.medicine);
+
 
   return (
     <div className="fade-in" style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 14, padding: 20, maxWidth: 620, boxShadow: '0 1px 4px rgba(0,0,0,0.06)' }}>
@@ -395,7 +503,6 @@ function PrescriptionCard({ data, onCreateOrder, onFindAlternatives, orderCreate
       {!orderCreated ? (
         <div style={{ display: 'flex', gap: 10 }}>
           <button onClick={onCreateOrder} disabled={!hasAnyMedicine} style={{ background: hasAnyMedicine ? '#2563eb' : '#94a3b8', color: '#fff', border: 'none', borderRadius: 8, padding: '10px 22px', cursor: hasAnyMedicine ? 'pointer' : 'not-allowed', fontWeight: 600, fontSize: 14 }}>Create Order</button>
-          <button onClick={onFindAlternatives} style={{ background: '#f8fafc', color: '#374151', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 22px', cursor: 'pointer', fontWeight: 500, fontSize: 14 }}>Find Alternatives</button>
         </div>
       ) : (
         <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: '10px 14px', color: '#16a34a', fontWeight: 600, fontSize: 14, display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -407,12 +514,14 @@ function PrescriptionCard({ data, onCreateOrder, onFindAlternatives, orderCreate
 }
 
 // ─── Live Context Panel ─────────────────────────────────────────────────────────
-function LiveContextPanel({ extractedData, loading, onRegisterNewPatient, countdown }) {
+function LiveContextPanel({ extractedData, loading, onRegisterNewPatient, countdown, step, liveInventory = [] }) {
   const { customer, medicines = [], patient_name } = extractedData || {};
   return (
     <div style={{ width: 300, borderLeft: '1px solid #e2e8f0', background: '#fff', overflowY: 'auto', flexShrink: 0, padding: 20 }}>
       <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>Live Context</h3>
-      <p style={{ color: '#64748b', fontSize: 12, marginBottom: 20, lineHeight: 1.5 }}>This pane updates automatically as the AI processes text/voice input.</p>
+      <p style={{ color: '#64748b', fontSize: 12, marginBottom: 20, lineHeight: 1.5 }}>This pane updates as the AI processes text/voice input.</p>
+
+
       {loading && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: '#64748b', fontSize: 13 }}>
           <div style={{ width: 16, height: 16, border: '2px solid #e2e8f0', borderTopColor: '#2563eb', borderRadius: '50%', animation: 'spin 0.8s linear infinite' }} />
@@ -591,222 +700,370 @@ function InventoryPage() {
 }
 
 
-// ─── AI Assistant Page (Guided Flow) ───────────────────────────────────────────
-function AssistantPage({ ollamaStatus, onNavigateToRegister, autoStartMic }) {
-  // Flow steps: 'name' → 'medicines' 
-  const [step, setStep] = useState('name');
-  const [messages, setMessages] = useState([{
-    id: 1, role: 'assistant', type: 'text',
-    text: '👋 Welcome! Please say or type the patient\'s full name to get started.'
-  }]);
+// ─── Bill View ──────────────────────────────────────────────────────────────────
+function BillView({ patient, medicines, onDone }) {
+  const selected = medicines.filter(m => m.selected !== false);
+  const grand = selected.reduce((s, m) => s + parseFloat(m.price) * Math.max(1, parseInt(m.qty) || 1), 0).toFixed(2);
+  const now = new Date();
+  const dateStr = now.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+  const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+
+  const handlePrint = () => {
+    const w = window.open('', '_blank', 'width=720,height=620');
+    const rows = selected.map(m => {
+      const qty = Math.max(1, parseInt(m.qty) || 1);
+      return `<tr><td>${m.name}</td><td>${m.dosage || m.dosageLabel || '-'}</td><td style="text-align:center">${qty}</td><td style="text-align:right">₹${parseFloat(m.price).toFixed(2)}</td><td style="text-align:right">₹${(parseFloat(m.price) * qty).toFixed(2)}</td></tr>`;
+    }).join('');
+    w.document.write(`<!DOCTYPE html><html><head><title>Bill</title><style>body{font-family:Arial,sans-serif;padding:32px;color:#111}.hdr{border-bottom:2px solid #000;padding-bottom:12px;margin-bottom:20px}h1{font-size:22px;margin:0 0 6px}table{width:100%;border-collapse:collapse;margin-bottom:16px}th{background:#0f172a;color:#fff;padding:8px 12px;text-align:left;font-size:12px}td{padding:8px 12px;border-bottom:1px solid #e5e7eb;font-size:13px}.tot{font-size:16px;font-weight:700;text-align:right;padding:8px 0}.ft{margin-top:24px;font-size:11px;color:#666;text-align:center}</style></head><body><div class="hdr"><h1>HackfusionRX Pharmacy</h1><div>Patient: <strong>${patient?.name || 'Walk-in'}</strong></div><div>${dateStr} · ${timeStr}</div></div><table><thead><tr><th>Medicine</th><th>Dosage</th><th style="text-align:center">Qty</th><th style="text-align:right">Price</th><th style="text-align:right">Subtotal</th></tr></thead><tbody>${rows}</tbody></table><div class="tot">Grand Total: ₹${grand}</div><div class="ft">Thank you for visiting HackfusionRX</div></body></html>`);
+    w.document.close(); w.focus(); setTimeout(() => w.print(), 400);
+  };
+
+  return (
+    <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 14, padding: 24, maxWidth: 660 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 18 }}>
+        <div>
+          <div style={{ fontSize: 18, fontWeight: 800, color: '#0f172a' }}>🧾 Bill Generated</div>
+          <div style={{ fontSize: 13, color: '#64748b', marginTop: 4 }}>Patient: <strong>{patient?.name || 'Walk-in'}</strong> · {dateStr} · {timeStr}</div>
+        </div>
+        <div style={{ display: 'flex', gap: 10 }}>
+          <button onClick={handlePrint} style={{ background: '#2563eb', color: '#fff', border: 'none', borderRadius: 8, padding: '8px 16px', fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>🖨 Print / PDF</button>
+          <button onClick={onDone} style={{ background: '#f1f5f9', color: '#374151', border: '1px solid #e2e8f0', borderRadius: 8, padding: '8px 14px', fontWeight: 500, fontSize: 13, cursor: 'pointer' }}>New Sale</button>
+        </div>
+      </div>
+      <div style={{ border: '1px solid #e2e8f0', borderRadius: 10, overflow: 'hidden', marginBottom: 14 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 0.6fr 1fr 1fr', background: '#1e293b', padding: '10px 14px', gap: 8 }}>
+          {['Medicine', 'Dosage', 'Qty', 'Unit Price', 'Total'].map(h => <div key={h} style={{ color: '#94a3b8', fontSize: 11, fontWeight: 700, textTransform: 'uppercase' }}>{h}</div>)}
+        </div>
+        {selected.map((m, i) => {
+          const qty = Math.max(1, parseInt(m.qty) || 1);
+          return (
+            <div key={m.id} style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 0.6fr 1fr 1fr', padding: '11px 14px', gap: 8, background: i % 2 === 0 ? '#fff' : '#fafafa', borderTop: '1px solid #f1f5f9', alignItems: 'center' }}>
+              <div style={{ fontWeight: 600, fontSize: 13 }}>{m.name}</div>
+              <div style={{ fontSize: 13, color: '#64748b' }}>{m.dosage || '-'}</div>
+              <div style={{ fontSize: 13, fontWeight: 600 }}>{qty}</div>
+              <div style={{ fontSize: 13 }}>₹{parseFloat(m.price).toFixed(2)}</div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: '#16a34a' }}>₹{(parseFloat(m.price) * qty).toFixed(2)}</div>
+            </div>
+          );
+        })}
+        <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 0.6fr 1fr 1fr', padding: '12px 14px', gap: 8, background: '#f8fafc', borderTop: '2px solid #e2e8f0' }}>
+          <div style={{ gridColumn: '1 / 5', fontWeight: 700, fontSize: 14 }}>Grand Total ({selected.length} item{selected.length !== 1 ? 's' : ''})</div>
+          <div style={{ fontWeight: 800, fontSize: 16, color: '#2563eb' }}>₹{grand}</div>
+        </div>
+      </div>
+      <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: '10px 14px', color: '#16a34a', fontWeight: 600, fontSize: 14, display: 'flex', alignItems: 'center', gap: 8 }}>
+        <Icon.Check /> Order created &amp; inventory updated!
+      </div>
+    </div>
+  );
+}
+
+
+// ─── Medicine Selection Table ────────────────────────────────────────────────────
+function MedicineSelectionTable({ medicines, patient, inputType, symptomText, onBillCreated }) {
+  const [rows, setRows] = useState(() => medicines.map(m => ({ ...m, selected: true, qty: m.qty || 1, editName: m.name, editDosage: m.dosage || '' })));
+  const [editMode, setEditMode] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState('');
+
+  const toggle = id => setRows(r => r.map(x => x.id === id ? { ...x, selected: !x.selected } : x));
+  const toggleAll = () => { const all = rows.every(r => r.selected); setRows(r => r.map(x => ({ ...x, selected: !all }))); };
+  const setQty = (id, v) => setRows(r => r.map(x => x.id === id ? { ...x, qty: v } : x));
+  const setName = (id, v) => setRows(r => r.map(x => x.id === id ? { ...x, editName: v } : x));
+  const setDosage = (id, v) => setRows(r => r.map(x => x.id === id ? { ...x, editDosage: v } : x));
+  const handleSave = () => { setRows(r => r.map(x => ({ ...x, name: x.editName, dosage: x.editDosage }))); setEditMode(false); };
+
+  const handleCreateBill = async () => {
+    const sel = rows.filter(r => r.selected);
+    if (!sel.length) { setError('Select at least one medicine.'); return; }
+    setCreating(true); setError('');
+    try {
+      for (const med of sel) {
+        await axios.post(`${API}/create-order`, {
+          customer_id: patient?.id || null, customer_name: patient?.name || 'Walk-in',
+          medicine_id: med.id, medicine_name: med.name, dosage: med.dosage || '',
+          quantity: Math.max(1, parseInt(med.qty) || 1), price_per_unit: med.price,
+        });
+      }
+      onBillCreated(rows);
+    } catch (err) { setError(err.response?.data?.error || err.message); }
+    setCreating(false);
+  };
+
+  const selCount = rows.filter(r => r.selected).length;
+  const grand = rows.filter(r => r.selected).reduce((s, r) => s + parseFloat(r.price) * (Math.max(1, parseInt(r.qty) || 1)), 0).toFixed(2);
+  const allSel = rows.every(r => r.selected);
+  const inS = { border: '1px solid #93c5fd', borderRadius: 6, padding: '4px 8px', fontSize: 13, outline: 'none', width: '100%' };
+
+  return (
+    <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 14, padding: 20, maxWidth: 720 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, flexWrap: 'wrap', gap: 10 }}>
+        <div>
+          <div style={{ fontWeight: 700, fontSize: 15 }}>{inputType === 'symptom' ? `💊 Suggested for "${symptomText}"` : '🧾 Prescription Table'}</div>
+          <div style={{ fontSize: 12, color: '#64748b', marginTop: 3 }}>{inputType === 'medicine' ? `${rows.length} medicine${rows.length !== 1 ? 's' : ''}` : `${selCount} selected`} · Total: <strong style={{ color: '#2563eb' }}>₹{grand}</strong></div>
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          {editMode
+            ? <button onClick={handleSave} style={{ background: '#16a34a', color: '#fff', border: 'none', borderRadius: 8, padding: '8px 14px', fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>💾 Save</button>
+            : <button onClick={() => setEditMode(true)} style={{ background: '#f8fafc', color: '#374151', border: '1px solid #e2e8f0', borderRadius: 8, padding: '8px 14px', fontWeight: 500, fontSize: 13, cursor: 'pointer' }}>✏️ Edit</button>
+          }
+          <button onClick={handleCreateBill} disabled={creating || selCount === 0} style={{ background: selCount > 0 && !creating ? '#2563eb' : '#94a3b8', color: '#fff', border: 'none', borderRadius: 8, padding: '8px 18px', fontWeight: 600, fontSize: 13, cursor: selCount > 0 && !creating ? 'pointer' : 'not-allowed' }}>
+            {creating ? '⏳ Creating...' : '🧾 Create Bill'}
+          </button>
+        </div>
+      </div>
+      <div style={{ border: '1px solid #e2e8f0', borderRadius: 10, overflow: 'hidden' }}>
+        {inputType === 'medicine' ? (<>
+          {/* Patient info header */}
+          {patient && <div style={{ background: '#f8fafc', padding: '10px 16px', borderBottom: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', fontSize: 13, color: '#475569' }}>
+            <span>Patient: <strong style={{ color: '#0f172a' }}>{patient.name}</strong></span>
+            <span>{new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })} · {new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })}</span>
+          </div>}
+          {/* 6-col header */}
+          <div style={{ display: 'grid', gridTemplateColumns: '2fr 0.9fr 0.7fr 0.6fr 0.6fr 1fr', background: '#1e293b', padding: '10px 14px', gap: 8, alignItems: 'center' }}>
+            {['Medicine', 'Dosage', 'Freq', 'Days', 'Qty', 'Subtotal'].map(h => <div key={h} style={{ color: '#94a3b8', fontSize: 11, fontWeight: 700, textTransform: 'uppercase' }}>{h}</div>)}
+          </div>
+          {/* Data rows + shortage warning */}
+          {rows.map((m, i) => {
+            const qty = Math.max(1, parseInt(m.qty) || 1);
+            const subtotal = (parseFloat(m.price) * qty).toFixed(2);
+            const shortage = m.stock < qty;
+            return (<React.Fragment key={m.id}>
+              <div style={{ display: 'grid', gridTemplateColumns: '2fr 0.9fr 0.7fr 0.6fr 0.6fr 1fr', padding: '12px 14px', gap: 8, background: i % 2 === 0 ? '#fff' : '#fafafa', borderTop: '1px solid #f1f5f9', alignItems: 'center' }}>
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: 13 }}>{m.name}</div>
+                  <div style={{ fontSize: 10, color: shortage ? '#dc2626' : '#16a34a', marginTop: 2 }}>
+                    {shortage ? `⚠ Only ${m.stock} left` : `✓ ${m.stock} in stock`}
+                  </div>
+                </div>
+                <div style={{ fontSize: 13, color: '#475569' }}>{m.dosageLabel || m.dosage || '1 pill'}</div>
+                <div style={{ fontSize: 13, color: '#475569' }}>{m.freqLabel || `${m.frequency || 1}x day`}</div>
+                <div style={{ fontSize: 13, color: '#475569' }}>{m.daysLabel || `${m.duration || 1}d`}</div>
+                <input
+                  type="text" inputMode="numeric" value={m.qty}
+                  onChange={e => setQty(m.id, e.target.value.replace(/[^0-9]/g, ''))}
+                  onBlur={e => { if (!e.target.value || parseInt(e.target.value) < 1) setQty(m.id, 1); }}
+                  style={{ width: 52, border: '1px solid #e2e8f0', borderRadius: 6, padding: '4px 6px', fontSize: 13, outline: 'none', textAlign: 'center', fontWeight: 700 }}
+                />
+                <div style={{ fontSize: 13, fontWeight: 700, color: '#16a34a' }}>₹{subtotal}</div>
+              </div>
+              {shortage && <div style={{ background: '#fef2f2', borderTop: '1px solid #fecaca', padding: '7px 14px', fontSize: 12, color: '#dc2626', display: 'flex', alignItems: 'center', gap: 6 }}>
+                △ Shortage of {qty - m.stock} {m.doseUnit || 'pills'} — only {m.stock} available in stock
+              </div>}
+            </React.Fragment>);
+          })}
+          {/* Grand total */}
+          <div style={{ display: 'grid', gridTemplateColumns: '2fr 0.9fr 0.7fr 0.6fr 0.6fr 1fr', padding: '13px 14px', gap: 8, background: '#f8fafc', borderTop: '2px solid #e2e8f0', alignItems: 'center' }}>
+            <div style={{ gridColumn: '1 / 6', fontWeight: 800, fontSize: 15 }}>Grand Total ({rows.length} medicine{rows.length !== 1 ? 's' : ''})</div>
+            <div style={{ fontWeight: 800, fontSize: 17, color: '#2563eb' }}>₹{grand}</div>
+          </div>
+        </>) : (<>
+          <div style={{ display: 'grid', gridTemplateColumns: '36px 2fr 1.2fr 70px 1fr 1fr', background: '#1e293b', padding: '10px 14px', gap: 8, alignItems: 'center' }}>
+            <input type="checkbox" checked={allSel} onChange={toggleAll} style={{ cursor: 'pointer' }} />
+            {['Medicine', 'Dosage', 'Qty', 'Unit Price', 'Total'].map(h => <div key={h} style={{ color: '#94a3b8', fontSize: 11, fontWeight: 700, textTransform: 'uppercase' }}>{h}</div>)}
+          </div>
+          {rows.map((m, i) => {
+            const qty = Math.max(1, parseInt(m.qty) || 1);
+            const total = (parseFloat(m.price) * qty).toFixed(2);
+            return (
+              <div key={m.id} style={{ display: 'grid', gridTemplateColumns: '36px 2fr 1.2fr 70px 1fr 1fr', padding: '11px 14px', gap: 8, background: m.selected ? (i % 2 === 0 ? '#fff' : '#fafafa') : '#f8fafc', borderTop: '1px solid #f1f5f9', alignItems: 'center', opacity: m.selected ? 1 : 0.5 }}>
+                <input type="checkbox" checked={m.selected} onChange={() => toggle(m.id)} style={{ cursor: 'pointer' }} />
+                <div>
+                  {editMode && m.selected ? <input value={m.editName} onChange={e => setName(m.id, e.target.value)} style={inS} />
+                    : <><div style={{ fontWeight: 600, fontSize: 13 }}>{m.name}</div>
+                      <span style={{ fontSize: 10, fontWeight: 700, background: m.stock < m.min_stock ? '#fee2e2' : '#dcfce7', color: m.stock < m.min_stock ? '#dc2626' : '#16a34a', padding: '1px 6px', borderRadius: 20, display: 'inline-block' }}>
+                        {m.stock < m.min_stock ? `⚠ ${m.stock} left` : `✓ ${m.stock} in stock`}
+                      </span></>}
+                </div>
+                <div>{editMode && m.selected ? <input value={m.editDosage} onChange={e => setDosage(m.id, e.target.value)} style={inS} /> : <span style={{ fontSize: 13, color: '#64748b' }}>{m.dosage || '-'}</span>}</div>
+                <input type="text" inputMode="numeric" value={m.qty} onChange={e => setQty(m.id, e.target.value.replace(/[^0-9]/g, ''))} onBlur={e => { if (!e.target.value || parseInt(e.target.value) < 1) setQty(m.id, 1); }} disabled={!m.selected} style={{ width: 64, border: '1px solid #e2e8f0', borderRadius: 6, padding: '4px 8px', fontSize: 13, outline: 'none', background: m.selected ? '#fff' : '#f1f5f9', color: '#0f172a', textAlign: 'center' }} />
+                <div style={{ fontSize: 13 }}>₹{parseFloat(m.price).toFixed(2)}</div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: m.selected ? '#16a34a' : '#94a3b8' }}>{m.selected ? `₹${total}` : '—'}</div>
+              </div>
+            );
+          })}
+          <div style={{ display: 'grid', gridTemplateColumns: '36px 2fr 1.2fr 70px 1fr 1fr', padding: '12px 14px', gap: 8, background: '#f8fafc', borderTop: '2px solid #e2e8f0' }}>
+            <div style={{ gridColumn: '1 / 6', fontWeight: 700, fontSize: 14 }}>Grand Total ({selCount} selected)</div>
+            <div style={{ fontWeight: 800, fontSize: 16, color: '#2563eb' }}>₹{grand}</div>
+          </div>
+        </>)}
+      </div>
+
+      {error && <div style={{ marginTop: 10, background: '#fef2f2', color: '#dc2626', padding: '10px 14px', borderRadius: 8, fontSize: 13 }}>❌ {error}</div>}
+    </div>
+  );
+}
+
+// ─── AI Assistant Page (Guided Sale Flow) ──────────────────────────────────────
+// registeredPatient: passed after new patient is registered — skips name-lookup step
+function AssistantPage({ ollamaStatus, onNavigateToRegister, registeredPatient, onRegisteredPatientUsed }) {
+  const initialStep = registeredPatient ? 'input' : 'name';
+  const [step, setStep] = useState(initialStep);
+  const [messages, setMessages] = useState(() => {
+    if (registeredPatient) {
+      return [{ id: 1, role: 'assistant', type: 'text', text: `✅ Patient registered: **${registeredPatient.name}**\n\nNow please say the medicines needed.\n\nExample: "Amoxicillin 250mg 1 pill 3 times a day for 7 days"` }];
+    }
+    return [{ id: 1, role: 'assistant', type: 'text', text: "👋 Welcome! Please type or speak the patient's full name to get started." }];
+  });
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [recording, setRecording] = useState(false);
-  const [liveData, setLiveData] = useState(null);
-  const [liveLoading, setLiveLoading] = useState(false);
-  const [orderCreatedIds, setOrderCreatedIds] = useState(new Set());
-  const [patientContext, setPatientContext] = useState(null); // found customer
+  const [patientContext, setPatientContext] = useState(registeredPatient || null);
+  const [liveInventory, setLiveInventory] = useState([]);
+
+  // Fetch live inventory for context panel
+  useEffect(() => {
+    axios.get(`${API}/medicines`).then(r => setLiveInventory(r.data)).catch(() => { });
+  }, [step]); // refresh each step change
 
   const messagesEndRef = useRef(null);
   const recognitionRef = useRef(null);
   const silenceTimerRef = useRef(null);
   const msgIdRef = useRef(2);
   const autoStarted = useRef(false);
+  // Refs so startRecording always reads the CURRENT step/handler (avoids stale closure bug)
+  const stepRef = useRef(step);
+  const handleInputRef = useRef(null);
 
+  // Clear parent's registeredPatient after we've consumed it (prevents stale state on re-navigation)
+  useEffect(() => { if (registeredPatient && onRegisteredPatientUsed) onRegisteredPatientUsed(); }, []);
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+  useEffect(() => { stepRef.current = step; }, [step]);
+  useEffect(() => { if (!autoStarted.current) { autoStarted.current = true; setTimeout(() => startRecording(), 600); } }, []);
 
-  // Auto-start mic when page loads or when autoStartMic prop changes
-  useEffect(() => {
-    if (!autoStarted.current) {
-      autoStarted.current = true;
-      setTimeout(() => startRecording(), 600);
-    }
-  }, []);
 
-  // If coming back from registration, auto-start mic for medicines
-  useEffect(() => {
-    if (autoStartMic && step === 'medicines') {
-      setTimeout(() => startRecording(), 600);
-    }
-  }, [autoStartMic, step]);
+  const addMsg = (msg) => { const id = msgIdRef.current++; setMessages(m => [...m, { id, ...msg }]); return id; };
 
-  const addMessage = (msg) => {
-    const id = msgIdRef.current++;
-    setMessages(m => [...m, { id, ...msg }]);
-    return id;
+  const resetFlow = () => {
+    setStep('name'); setPatientContext(null);
+    setMessages([{ id: msgIdRef.current++, role: 'assistant', type: 'text', text: "👋 New sale started. Please type or click the mic to speak the patient's name." }]);
+    // Recording does NOT auto-restart — user must click the mic button manually
   };
 
-  // ── Step 1: Look up patient name ──────────────────────────────────────────────
   const lookupPatient = useCallback(async (text) => {
     if (!text.trim() || loading) return;
-    addMessage({ role: 'user', type: 'text', text: text.trim() });
-    setInput('');
-    setLoading(true);
-
+    addMsg({ role: 'user', type: 'text', text: text.trim() });
+    setInput(''); setLoading(true);
     try {
-      const res = await axios.get(`${API}/customers`);
-      const all = res.data;
-      const nameLower = text.trim().toLowerCase();
-      let found = all.find(c => c.name.toLowerCase() === nameLower);
-      if (!found) found = all.find(c => {
-        const cp = c.name.toLowerCase().split(' ');
-        const np = nameLower.split(' ');
-        return np.every(p => cp.some(cp2 => cp2.includes(p) || p.includes(cp2)));
-      });
-      if (!found) found = all.find(c => c.name.toLowerCase().startsWith(nameLower.split(' ')[0]));
-
+      const all = (await axios.get(`${API}/customers`)).data;
+      const nl = text.trim().toLowerCase();
+      let found = all.find(c => c.name.toLowerCase() === nl)
+        || all.find(c => {
+          const cp = c.name.toLowerCase().split(' ');
+          // Only use search words that are at least 3 chars (avoids matching "a", "in" etc.)
+          const np = nl.split(' ').filter(p => p.length >= 3);
+          if (!np.length) return false;
+          // Each search word must be a substring of some customer name word (one-way only)
+          return np.every(p => cp.some(c2 => c2.includes(p)));
+        })
+        || (() => {
+          const firstWord = nl.split(' ')[0];
+          // Prefix match only if first name part is at least 4 chars (avoids "ab" etc.)
+          return firstWord.length >= 4 ? all.find(c => c.name.toLowerCase().startsWith(firstWord)) : null;
+        })();
       if (found) {
-        setPatientContext(found);
-        setStep('medicines');
-        addMessage({
-          role: 'assistant', type: 'text',
-          text: `✅ Patient found: **${found.name}**${found.allergies && found.allergies !== 'None' ? `\n⚠️ Allergies: ${found.allergies}` : ''}\n\nNow please say the medicines needed.\n\nExample: "Amoxicillin 250mg 1 pill 3 times a day for 7 days"`
-        });
-        // Auto-start mic for medicine input
-        setTimeout(() => startRecording(), 800);
+        setPatientContext(found); setStep('input');
+        addMsg({ role: 'assistant', type: 'text', text: `✅ Patient Found: **${found.name}**${found.allergies && found.allergies !== 'None' ? `\n⚠️ Allergies: ${found.allergies}` : '\nAllergies: None'}\n\nNow please say the medicines needed.\n\nExample: "Amoxicillin 250mg 1 pill 3 times a day for 7 days"\n\n🎤 *Click the mic button to speak, or type below.*` });
+        // Recording does NOT auto-restart — user must click mic manually
       } else {
-        addMessage({
-          role: 'assistant', type: 'text',
-          text: `❌ Patient "${text.trim()}" not found in database.\n\nRedirecting to registration in 3 seconds...`
-        });
+        addMsg({ role: 'assistant', type: 'text', text: `❌ Patient "${text.trim()}" not found.\n\nRedirecting to registration in 3 seconds...` });
         setTimeout(() => onNavigateToRegister(text.trim()), 3000);
       }
-    } catch (err) {
-      addMessage({ role: 'assistant', type: 'text', text: `❌ Error looking up patient: ${err.message}` });
-    }
+    } catch (err) { addMsg({ role: 'assistant', type: 'text', text: `❌ Error: ${err.message}` }); }
     setLoading(false);
   }, [loading]);
 
-  // ── Step 2: Process medicines ─────────────────────────────────────────────────
-  const processMedicines = useCallback(async (text) => {
+  const processInput = useCallback(async (text) => {
     if (!text.trim() || loading) return;
-    const fullText = patientContext
-      ? `${patientContext.name} needs ${text.trim()}`
-      : text.trim();
-
-    addMessage({ role: 'user', type: 'text', text: text.trim() });
-    setInput('');
-    setLoading(true);
-    setLiveLoading(true);
-    setLiveData(null);
-
+    addMsg({ role: 'user', type: 'text', text: text.trim() });
+    setInput(''); setLoading(true);
     try {
-      const res = await axios.post(`${API}/extract-prescription`, { text: fullText });
-      const data = res.data.data;
-      // Inject known customer back in case Ollama didn't match
-      if (patientContext && !data.customer) data.customer = patientContext;
-      setLiveData(data);
-      setLiveLoading(false);
-      addMessage({ role: 'assistant', type: 'prescription', data });
-    } catch (err) {
-      setLiveLoading(false);
-      addMessage({ role: 'assistant', type: 'text', text: `❌ Error: ${err.response?.data?.error || err.message}` });
-    }
-    setLoading(false);
-  }, [loading, patientContext]);
-
-  // ── Route input to correct step ───────────────────────────────────────────────
-  const processInput = useCallback((text) => {
-    if (step === 'name') lookupPatient(text);
-    else processMedicines(text);
-  }, [step, lookupPatient, processMedicines]);
-
-  // ── Create order ──────────────────────────────────────────────────────────────
-  const handleCreateOrder = useCallback(async (prescriptionData, msgId) => {
-    const { patient_name, medicines = [], customer } = prescriptionData;
-    const validMeds = medicines.filter(m => m.medicine);
-    if (validMeds.length === 0) return;
-    try {
-      const orderIds = [];
-      for (const med of validMeds) {
-        const res = await axios.post(`${API}/create-order`, {
-          customer_id: customer?.id || null, customer_name: patient_name,
-          medicine_id: med.medicine.id, medicine_name: med.medicine.name,
-          dosage: `${med.dosage} / ${med.frequency}`, quantity: med.quantity, price_per_unit: med.medicine.price,
-        });
-        orderIds.push(res.data.order_id);
+      const allMeds = (await axios.get(`${API}/medicines`)).data;
+      const type = detectType(text);
+      let matched;
+      if (type === 'symptom') {
+        matched = symptomMeds(text, allMeds);
+      } else {
+        // Use prescription parser → extracts dosage/frequency/duration, calculates total qty
+        matched = parsePrescription(text, allMeds);
+        if (!matched.length) matched = medicineMeds(text, allMeds); // fallback
       }
-      setOrderCreatedIds(prev => new Set([...prev, msgId]));
-      addMessage({
-        role: 'assistant', type: 'text',
-        text: `✅ ${orderIds.length} order(s) created! IDs: ${orderIds.map(id => '#' + id).join(', ')}\n💰 Grand Total: $${prescriptionData.grand_total}\n\nSay a new patient name to start another prescription.`
-      });
-      // Reset for next patient
-      setStep('name');
-      setPatientContext(null);
-      setLiveData(null);
-      setTimeout(() => startRecording(), 1000);
-    } catch (err) {
-      addMessage({ role: 'assistant', type: 'text', text: `❌ Failed: ${err.response?.data?.error || err.message}` });
-    }
-  }, []);
+      if (!matched.length) {
+        addMsg({ role: 'assistant', type: 'text', text: `⚠️ No medicines found for "${text.trim()}". Showing all available medicines.` });
+        matched = allMeds;
+      } else {
+        addMsg({
+          role: 'assistant', type: 'text', text: type === 'symptom'
+            ? `🔍 Detected **symptoms** — showing ${matched.length} suggested medicine(s). Select and create the bill.`
+            : `🔍 Detected **${matched.length} medicine${matched.length !== 1 ? 's' : ''}** — quantities calculated from prescription.`
+        });
+      }
+      addMsg({ role: 'assistant', type: 'selection', medicines: matched, inputType: type, symptomText: text.trim() });
+      setStep('select');
+    } catch (err) { addMsg({ role: 'assistant', type: 'text', text: `❌ Error: ${err.message}` }); }
+    setLoading(false);
+  }, [loading]);
 
-  const handleFindAlternatives = useCallback(async (prescriptionData) => {
-    const { medicines = [] } = prescriptionData;
-    if (medicines.length === 0) return;
-    try {
-      const firstMed = medicines[0];
-      const res = await axios.get(`${API}/alternatives/${encodeURIComponent(firstMed.medicine_name)}?exclude=${firstMed.medicine?.id || 0}`);
-      if (res.data.length === 0) addMessage({ role: 'assistant', type: 'text', text: 'No alternatives found.' });
-      else addMessage({ role: 'assistant', type: 'text', text: `Available alternatives:\n${res.data.map(m => `• ${m.name} — Stock: ${m.stock}, $${m.price}/pill`).join('\n')}` });
-    } catch { addMessage({ role: 'assistant', type: 'text', text: 'Could not fetch alternatives.' }); }
-  }, []);
+  const handleInput = useCallback((text) => {
+    if (step === 'name') lookupPatient(text);
+    else if (step === 'input') processInput(text);
+  }, [step, lookupPatient, processInput]);
 
-  // ── Voice recording ───────────────────────────────────────────────────────────
+  // Keep handleInputRef in sync so startRecording always calls the latest version
+  useEffect(() => { handleInputRef.current = handleInput; }, [handleInput]);
+
+  const handleBillCreated = (medicineRows) => {
+    setMessages(m => [...m.filter(msg => msg.type !== 'selection'), { id: msgIdRef.current++, role: 'assistant', type: 'bill', medicines: medicineRows }]);
+    setStep('bill');
+  };
+
   const startRecording = () => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) return;
-    const recognition = new SR();
-    recognition.continuous = true; recognition.interimResults = true; recognition.lang = 'en-US';
-    recognition.onresult = (event) => {
-      const transcript = Array.from(event.results).map(r => r[0].transcript).join('');
-      setInput(transcript);
+    const r = new SR(); r.continuous = true; r.interimResults = true; r.lang = 'en-US';
+    r.onresult = (e) => {
+      const t = Array.from(e.results).map(x => x[0].transcript.trim()).join(' ').trim();
+      setInput(t);
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      const silenceMs = stepRef.current === 'input' ? 5000 : 2000;
       silenceTimerRef.current = setTimeout(() => {
         stopRecording();
-        processInput(transcript);
-      }, 2000);
+        if (t.trim().length < 3) {
+          addMsg({ role: 'assistant', type: 'text', text: "🎤 Sorry, I didn't catch that. Could you repeat? Click the mic button when ready." });
+          return;
+        }
+        handleInputRef.current?.(t);
+      }, silenceMs);
     };
-    recognition.onerror = () => stopRecording();
-    recognition.onend = () => setRecording(false);
-    try { recognition.start(); recognitionRef.current = recognition; setRecording(true); } catch (e) { }
+    r.onerror = () => stopRecording();
+    r.onend = () => setRecording(false);
+    try { r.start(); recognitionRef.current = r; setRecording(true); } catch (e) { }
   };
 
-  const stopRecording = () => {
-    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-    recognitionRef.current?.stop();
-    setRecording(false);
-  };
+  const stopRecording = () => { if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current); recognitionRef.current?.stop(); setRecording(false); };
 
-  const stepLabel = step === 'name'
-    ? '🔍 Step 1: Identify Patient'
-    : `💊 Step 2: Enter Medicines for ${patientContext?.name || 'Patient'}`;
+  const stepColors = { name: ['#dbeafe', '#1d4ed8'], input: ['#fef3c7', '#92400e'], select: ['#ede9fe', '#5b21b6'], bill: ['#dcfce7', '#16a34a'] };
+  const stepLabels = { name: '🔍 Step 1: Patient Name', input: `💬 Step 2: Medicines / Symptoms`, select: '☑️ Step 3: Select & Bill', bill: '✅ Bill Created' };
 
   return (
     <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+      {/* ── Main chat column ── */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', padding: 24, overflow: 'hidden' }}>
-
-        {/* Assistant header */}
-        <div style={{ background: '#f8fafc', borderRadius: 12, padding: '12px 16px', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 12, border: '1px solid #e2e8f0' }}>
+        {/* Header */}
+        <div style={{ background: '#f8fafc', borderRadius: 12, padding: '12px 16px', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 12, border: '1px solid #e2e8f0', flexShrink: 0 }}>
           <div style={{ width: 44, height: 44, borderRadius: '50%', background: 'linear-gradient(135deg, #3b82f6, #06b6d4)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff' }}><Icon.Bot /></div>
           <div style={{ flex: 1 }}>
             <div style={{ fontWeight: 700, fontSize: 15 }}>HackfusionRX Assistant</div>
             <div style={{ fontSize: 12, color: '#16a34a', display: 'flex', alignItems: 'center', gap: 5 }}>
-              <div style={{ width: 7, height: 7, borderRadius: '50%', background: '#16a34a' }} />
-              Online · Ollama ({ollamaStatus?.activeModel || 'llama3.2'})
+              <div style={{ width: 7, height: 7, borderRadius: '50%', background: '#16a34a' }} /> Online · AI Guided Sale
             </div>
           </div>
-          {/* Step indicator */}
-          <div style={{ background: step === 'name' ? '#dbeafe' : '#dcfce7', color: step === 'name' ? '#1d4ed8' : '#16a34a', fontSize: 12, fontWeight: 700, padding: '4px 12px', borderRadius: 20 }}>
-            {stepLabel}
-          </div>
+          <div style={{ background: stepColors[step][0], color: stepColors[step][1], fontSize: 12, fontWeight: 700, padding: '4px 12px', borderRadius: 20 }}>{stepLabels[step]}</div>
         </div>
 
-        {/* Recording indicator bar */}
         {recording && (
-          <div style={{ background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 8, padding: '8px 14px', marginBottom: 10, display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: '#dc2626' }}>
-            <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#dc2626', flexShrink: 0 }} />
-            <span>🎤 Listening{step === 'name' ? ' for patient name' : ' for medicines'}... auto-submits after 2s silence</span>
+          <div style={{ background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 8, padding: '8px 14px', marginBottom: 10, display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: '#dc2626', flexShrink: 0 }}>
+            <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#dc2626' }} /> 🎤 Listening… auto-submits after {step === 'input' ? '5s' : '2s'} silence
           </div>
         )}
 
@@ -815,12 +1072,12 @@ function AssistantPage({ ollamaStatus, onNavigateToRegister, autoStartMic }) {
           {messages.map(msg => (
             <div key={msg.id} className="fade-in" style={{ display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start', gap: 10, alignItems: 'flex-start' }}>
               {msg.role === 'assistant' && <div style={{ width: 34, height: 34, borderRadius: '50%', flexShrink: 0, background: 'linear-gradient(135deg, #3b82f6, #06b6d4)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff' }}><Icon.Bot /></div>}
-              {msg.type === 'prescription' ? (
-                <PrescriptionCard data={msg.data} orderCreated={orderCreatedIds.has(msg.id)} onCreateOrder={() => handleCreateOrder(msg.data, msg.id)} onFindAlternatives={() => handleFindAlternatives(msg.data)} />
+              {msg.type === 'selection' ? (
+                <MedicineSelectionTable medicines={msg.medicines} patient={patientContext} inputType={msg.inputType} symptomText={msg.symptomText} onBillCreated={handleBillCreated} />
+              ) : msg.type === 'bill' ? (
+                <BillView patient={patientContext} medicines={msg.medicines} onDone={resetFlow} />
               ) : (
-                <div style={{ background: msg.role === 'user' ? '#2563eb' : '#fff', color: msg.role === 'user' ? '#fff' : '#0f172a', border: msg.role === 'user' ? 'none' : '1px solid #e2e8f0', borderRadius: msg.role === 'user' ? '18px 18px 4px 18px' : '4px 18px 18px 18px', padding: '12px 16px', maxWidth: 520, fontSize: 14, lineHeight: 1.65, whiteSpace: 'pre-line' }}>
-                  {msg.text}
-                </div>
+                <div style={{ background: msg.role === 'user' ? '#2563eb' : '#fff', color: msg.role === 'user' ? '#fff' : '#0f172a', border: msg.role === 'user' ? 'none' : '1px solid #e2e8f0', borderRadius: msg.role === 'user' ? '18px 18px 4px 18px' : '4px 18px 18px 18px', padding: '12px 16px', maxWidth: 520, fontSize: 14, lineHeight: 1.65, whiteSpace: 'pre-line' }}>{msg.text}</div>
               )}
               {msg.role === 'user' && <div style={{ width: 34, height: 34, borderRadius: '50%', flexShrink: 0, background: '#2563eb', color: '#fff', fontWeight: 700, fontSize: 15, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>P</div>}
             </div>
@@ -830,43 +1087,47 @@ function AssistantPage({ ollamaStatus, onNavigateToRegister, autoStartMic }) {
               <div style={{ width: 34, height: 34, borderRadius: '50%', flexShrink: 0, background: 'linear-gradient(135deg, #3b82f6, #06b6d4)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff' }}><Icon.Bot /></div>
               <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: '4px 18px 18px 18px', padding: '12px 18px', color: '#64748b', fontSize: 13, display: 'flex', alignItems: 'center', gap: 10 }}>
                 <div style={{ width: 14, height: 14, border: '2px solid #e2e8f0', borderTopColor: '#3b82f6', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
-                {step === 'name' ? 'Searching patient database...' : 'Ollama extracting prescription...'}
+                {step === 'name' ? 'Searching patient database...' : 'Matching medicines...'}
               </div>
             </div>
           )}
           <div ref={messagesEndRef} />
         </div>
 
-        {/* Input bar */}
-        <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginTop: 16, background: '#fff', border: `2px solid ${recording ? '#fca5a5' : '#e2e8f0'}`, borderRadius: 14, padding: '8px 8px 8px 16px', boxShadow: '0 1px 4px rgba(0,0,0,0.05)', transition: 'border-color 0.2s' }}>
-          <button onClick={recording ? stopRecording : startRecording} style={{ background: recording ? '#fee2e2' : '#2563eb', border: 'none', borderRadius: '50%', width: 38, height: 38, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', color: recording ? '#dc2626' : '#fff', flexShrink: 0 }}>
-            {recording ? <Icon.MicOff /> : <Icon.Mic />}
-          </button>
-          <input
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && !e.shiftKey && processInput(input)}
-            placeholder={
-              recording
-                ? (step === 'name' ? '🎤 Listening for patient name...' : '🎤 Listening for medicines...')
-                : (step === 'name' ? 'Type or speak patient name...' : 'Type or speak medicines needed...')
-            }
-            style={{ flex: 1, border: 'none', outline: 'none', fontSize: 14, color: '#0f172a', background: 'transparent', fontStyle: recording ? 'italic' : 'normal' }}
-          />
-          <button onClick={() => processInput(input)} disabled={loading || !input.trim()} style={{ background: input.trim() && !loading ? '#2563eb' : '#e2e8f0', color: input.trim() && !loading ? '#fff' : '#94a3b8', border: 'none', borderRadius: 10, width: 40, height: 38, cursor: input.trim() && !loading ? 'pointer' : 'not-allowed', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-            <Icon.Send />
-          </button>
-        </div>
+        {/* Input bar – only show on name/input steps */}
+        {(step === 'name' || step === 'input') && (
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginTop: 16, background: '#fff', border: `2px solid ${recording ? '#fca5a5' : '#e2e8f0'}`, borderRadius: 14, padding: '8px 8px 8px 16px', boxShadow: '0 1px 4px rgba(0,0,0,0.05)', flexShrink: 0 }}>
+            <button onClick={recording ? stopRecording : startRecording} style={{ background: recording ? '#fee2e2' : '#2563eb', border: 'none', borderRadius: '50%', width: 38, height: 38, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', color: recording ? '#dc2626' : '#fff', flexShrink: 0 }}>
+              {recording ? <Icon.MicOff /> : <Icon.Mic />}
+            </button>
+            <input value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => e.key === 'Enter' && !e.shiftKey && handleInput(input)}
+              placeholder={recording ? '🎤 Listening...' : step === 'name' ? 'Type or speak patient name...' : 'Type medicines (e.g. Amoxicillin) or symptoms (e.g. fever)...'}
+              style={{ flex: 1, border: 'none', outline: 'none', fontSize: 14, color: '#0f172a', background: 'transparent', fontStyle: recording ? 'italic' : 'normal' }} />
+            <button title="Upload prescription image" style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, width: 38, height: 38, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b', flexShrink: 0 }}>
+              <Icon.Upload />
+            </button>
+            <button onClick={() => handleInput(input)} disabled={loading || !input.trim()} style={{ background: input.trim() && !loading ? '#2563eb' : '#e2e8f0', color: input.trim() && !loading ? '#fff' : '#94a3b8', border: 'none', borderRadius: 10, width: 40, height: 38, cursor: input.trim() && !loading ? 'pointer' : 'not-allowed', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+              <Icon.Send />
+            </button>
+          </div>
+        )}
       </div>
-
-      {/* Live context panel */}
-      <LiveContextPanel extractedData={liveData} loading={liveLoading} countdown={null} onRegisterNewPatient={(name) => onNavigateToRegister(name)} />
+      <LiveContextPanel
+        extractedData={patientContext ? { customer: patientContext, medicines: [], patient_name: patientContext.name } : null}
+        loading={loading}
+        liveInventory={liveInventory}
+        step={step}
+        onRegisterNewPatient={onNavigateToRegister}
+        countdown={null}
+      />
     </div>
   );
 }
 
+
+
 // ─── Dashboard ──────────────────────────────────────────────────────────────────
-function DashboardPage() {
+function DashboardPage({ onNavigate }) {
   const [stats, setStats] = useState(null);
   useEffect(() => { axios.get(`${API}/stats`).then(r => setStats(r.data)); }, []);
   const cards = stats ? [
@@ -889,6 +1150,35 @@ function DashboardPage() {
           ))}
         </div>
       ) : <div style={{ color: '#64748b' }}>Loading stats...</div>}
+
+      {/* Ask the Assistant block */}
+      <div style={{ marginTop: 28, background: '#fff', border: '1px solid #e2e8f0', borderRadius: 16, padding: 24, boxShadow: '0 1px 6px rgba(0,0,0,0.05)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 20 }}>
+          <div style={{ width: 46, height: 46, borderRadius: 12, background: 'linear-gradient(135deg, #3b82f6, #06b6d4)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff' }}><Icon.Bot /></div>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 17, color: '#0f172a' }}>Ask the Assistant</div>
+            <div style={{ fontSize: 13, color: '#64748b', marginTop: 2 }}>Start a guided AI sale or record a purchase</div>
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 14 }}>
+          <button
+            onClick={() => onNavigate('assistant')}
+            onMouseEnter={e => e.currentTarget.style.transform = 'translateY(-1px)'}
+            onMouseLeave={e => e.currentTarget.style.transform = 'translateY(0)'}
+            style={{ flex: 1, background: 'linear-gradient(135deg, #2563eb, #1d4ed8)', color: '#fff', border: 'none', borderRadius: 12, padding: '14px 20px', fontWeight: 700, fontSize: 15, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, boxShadow: '0 2px 8px rgba(37,99,235,0.3)', transition: 'transform 0.15s' }}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
+            New Sale
+          </button>
+          <button
+            onClick={() => onNavigate('reports')}
+            onMouseEnter={e => e.currentTarget.style.background = '#f1f5f9'}
+            onMouseLeave={e => e.currentTarget.style.background = '#f8fafc'}
+            style={{ flex: 1, background: '#f8fafc', color: '#374151', border: '1px solid #e2e8f0', borderRadius: 12, padding: '14px 20px', fontWeight: 600, fontSize: 15, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, transition: 'background 0.15s' }}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
+            New Purchase
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -938,9 +1228,9 @@ export default function App() {
       .catch(() => setOllamaStatus({ ok: false, error: 'Backend not running' }));
   }, []);
 
-  const [returnedFromRegister, setReturnedFromRegister] = useState(false);
-  const handleNavigateToRegister = (name) => { setNewPatientName(name); setShowRegister(true); setReturnedFromRegister(false); };
-  const handlePatientCreated = () => { setShowRegister(false); setActivePage('assistant'); setReturnedFromRegister(true); };
+  const [registeredPatient, setRegisteredPatient] = useState(null);
+  const handleNavigateToRegister = (name) => { setNewPatientName(name); setShowRegister(true); };
+  const handlePatientCreated = (patient) => { setRegisteredPatient(patient); setShowRegister(false); setActivePage('assistant'); };
 
   const pageTitle = { assistant: 'AI Voice & Text Assistant', dashboard: 'Dashboard', inventory: 'Inventory', customers: 'Customers', reports: 'Purchase History' };
 
@@ -952,7 +1242,7 @@ export default function App() {
           <div>
             <h2 style={{ margin: 0, fontSize: 20, fontWeight: 700 }}>{showRegister ? 'New Patient Registration' : pageTitle[activePage]}</h2>
             {activePage === 'assistant' && !showRegister && <p style={{ margin: 0, color: '#64748b', fontSize: 12, marginTop: 2 }}>Automate prescription extraction and inventory checks using Ollama AI (free, local).</p>}
-            {showRegister && <p style={{ margin: 0, color: '#64748b', fontSize: 12, marginTop: 2 }}>Register new patient → auto-redirects back to prescription assistant in 5s</p>}
+            {showRegister && <p style={{ margin: 0, color: '#64748b', fontSize: 12, marginTop: 2 }}>Register new patient → auto-redirects back to assistant in 3s</p>}
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
             {ollamaStatus && (
@@ -973,8 +1263,8 @@ export default function App() {
           {showRegister ? (
             <NewPatientPage detectedName={newPatientName} onPatientCreated={handlePatientCreated} onSkip={() => { setShowRegister(false); setActivePage('assistant'); }} />
           ) : activePage === 'assistant' ? (
-            <AssistantPage ollamaStatus={ollamaStatus} onNavigateToRegister={handleNavigateToRegister} autoStartMic={returnedFromRegister} />
-          ) : activePage === 'dashboard' ? <DashboardPage />
+            <AssistantPage ollamaStatus={ollamaStatus} onNavigateToRegister={handleNavigateToRegister} registeredPatient={registeredPatient} onRegisteredPatientUsed={() => setRegisteredPatient(null)} />
+          ) : activePage === 'dashboard' ? <DashboardPage onNavigate={(p) => { setShowRegister(false); setActivePage(p); }} />
             : activePage === 'inventory' ? <InventoryPage />
               : activePage === 'customers' ? <CustomersPage />
                 : <HistoryPage />}

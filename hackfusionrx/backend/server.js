@@ -292,6 +292,7 @@ app.get('/api/stats', (req, res) => {
     });
 });
 
+
 // ─── Start Server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
     console.log(`\n🚀 HackfusionRX Backend running on http://localhost:${PORT}`);
@@ -306,5 +307,6 @@ app.listen(PORT, () => {
     console.log(`  GET  /api/medicines`);
     console.log(`  GET  /api/purchase-history`);
     console.log(`  GET  /api/alternatives/:name`);
-    console.log(`  GET  /api/stats\n`);
+    console.log(`  GET  /api/stats`);
+    console.log(`  POST /api/send-email\n`);
 });
