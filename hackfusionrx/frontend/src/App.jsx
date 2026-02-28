@@ -945,22 +945,9 @@ function AssistantPage({ ollamaStatus, onNavigateToRegister, registeredPatient, 
     addMsg({ role: 'user', type: 'text', text: text.trim() });
     setInput(''); setLoading(true);
     try {
-      const all = (await axios.get(`${API}/customers`)).data;
-      const nl = text.trim().toLowerCase();
-      let found = all.find(c => c.name.toLowerCase() === nl)
-        || all.find(c => {
-          const cp = c.name.toLowerCase().split(' ');
-          // Only use search words that are at least 3 chars (avoids matching "a", "in" etc.)
-          const np = nl.split(' ').filter(p => p.length >= 3);
-          if (!np.length) return false;
-          // Each search word must be a substring of some customer name word (one-way only)
-          return np.every(p => cp.some(c2 => c2.includes(p)));
-        })
-        || (() => {
-          const firstWord = nl.split(' ')[0];
-          // Prefix match only if first name part is at least 4 chars (avoids "ab" etc.)
-          return firstWord.length >= 4 ? all.find(c => c.name.toLowerCase().startsWith(firstWord)) : null;
-        })();
+      // Delegate fuzzy matching to the backend so both always use the same logic
+      const { data } = await axios.get(`${API}/customers/search`, { params: { name: text.trim() } });
+      const found = data.found ? data.customer : null;
       if (found) {
         setPatientContext(found); setStep('input');
         addMsg({ role: 'assistant', type: 'text', text: `✅ Patient Found: **${found.name}**${found.allergies && found.allergies !== 'None' ? `\n⚠️ Allergies: ${found.allergies}` : '\nAllergies: None'}\n\nNow please say the medicines needed.\n\nExample: "Amoxicillin 250mg 1 pill 3 times a day for 7 days"\n\n🎤 *Click the mic button to speak, or type below.*` });
